@@ -1,1 +1,27 @@
+# Folder hasil kompilasi PyInstaller (Wajib di-ignore agar repo tidak bengkak)
+build/
+dist/
+
+# File spesifikasi PyInstaller
+*.spec
+
+# File sementara batch/update
+update_temp.exe
+updater.bat
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment (jika ada)
+venv/
+env/
+.env
+
+# Script upload yang berisi Personal Access Token GitHub (PENTING untuk keamanan)
 upload_release.py
+
+# File editor/IDE
+.vscode/
+.idea/

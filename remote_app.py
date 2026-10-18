@@ -33,7 +33,7 @@ except Exception:
 # ==========================================
 # KONFIGURASI APLIKASI & GITHUB RELEASES
 # ==========================================
-CURRENT_VERSION = "v1.0.0"
+CURRENT_VERSION = "v1.0.1"
 GITHUB_REPO = "nugrohotanjo/local-remote"
 
 VIDEO_PORT = 9999
