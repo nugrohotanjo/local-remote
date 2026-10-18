@@ -2,16 +2,15 @@
 setlocal
 
 set APP_NAME=LAN_RemoteDesktop
-set MAIN_SCRIPT=remote_app.py
+set MAIN_SCRIPT=main.py
 
-set /p NEW_TAG="Masukkan Versi Release Baru (misal v1.0.1): "
+set /p NEW_TAG="Masukkan Versi Release Baru (misal v1.0.6): "
 
 echo ==========================================
 echo     BUILDING STANDALONE EXECUTABLE
 echo ==========================================
 
-:: Tutup paksa jika aplikasi sedang terbuka
-taskkill /f /im %APP_NAME%.exe 2>nul
+taskkill /f /im %APP_NAME%*.exe 2>nul
 
 echo [*] Membersihkan cache lama...
 if exist build rmdir /s /q build
