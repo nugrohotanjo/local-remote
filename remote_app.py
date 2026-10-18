@@ -1,15 +1,40 @@
+import os
+import sys
+import json
 import socket
 import struct
 import pickle
 import threading
+import subprocess
+import urllib.request
 import tkinter as tk
 from tkinter import messagebox
 import cv2
 import mss
 import numpy as np
 import pyautogui
+import ctypes
 
+# ==========================================
+# 0. SISTEM & DISPLAY SCALING FIX
+# ==========================================
+# Mematikan failsafe PyAutoGUI agar kursor tidak crash saat menyentuh sudut layar
 pyautogui.FAILSAFE = False
+
+# Mengaktifkan DPI Awareness agar Windows tidak memanipulasi koordinat pixel (125%/150% scaling)
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# ==========================================
+# KONFIGURASI APLIKASI & GITHUB RELEASES
+# ==========================================
+CURRENT_VERSION = "v1.0.0"
+GITHUB_REPO = "nugrohotanjo/local-remote"
 
 VIDEO_PORT = 9999
 INPUT_PORT = 9998
@@ -31,6 +56,8 @@ def run_input_server():
         monitor = sct.monitors[1]
         screen_w = monitor["width"]
         screen_h = monitor["height"]
+        screen_left = monitor["left"]
+        screen_top = monitor["top"]
 
     payload_size = struct.calcsize(">L")
 
@@ -66,13 +93,14 @@ def run_input_server():
                 action = cmd.get("type")
 
                 if action == "move":
-                    target_x = int(cmd["norm_x"] * screen_w)
-                    target_y = int(cmd["norm_y"] * screen_h)
+                    target_x = screen_left + int(cmd["norm_x"] * screen_w)
+                    target_y = screen_top + int(cmd["norm_y"] * screen_h)
                     pyautogui.moveTo(target_x, target_y)
                 elif action == "click":
-                    target_x = int(cmd["norm_x"] * screen_w)
-                    target_y = int(cmd["norm_y"] * screen_h)
-                    pyautogui.click(target_x, target_y, button=cmd.get("btn", "left"))
+                    target_x = screen_left + int(cmd["norm_x"] * screen_w)
+                    target_y = screen_top + int(cmd["norm_y"] * screen_h)
+                    pyautogui.moveTo(target_x, target_y)
+                    pyautogui.click(button=cmd.get("btn", "left"))
                 elif action == "key":
                     key = cmd.get("key")
                     if key:
@@ -116,7 +144,6 @@ def run_video_server():
 # 2. VIEWER / CLIENT (Bagian yang mengontrol)
 # ==========================================
 def start_remote_session(target_ip):
-    win_w, win_h = 1280, 720
     window_name = f"Controlling: {target_ip} (Tekan 'q' untuk keluar)"
 
     try:
@@ -129,6 +156,9 @@ def start_remote_session(target_ip):
         messagebox.showerror("Koneksi Gagal", f"Tidak dapat terhubung ke {target_ip}:\n{e}")
         return
 
+    # Menyimpan resolusi frame aktual secara dinamis
+    current_frame_shape = {"w": 1920, "h": 1080}
+
     def send_command(cmd_dict):
         try:
             data = pickle.dumps(cmd_dict)
@@ -138,8 +168,12 @@ def start_remote_session(target_ip):
             pass
 
     def on_mouse(event, x, y, flags, param):
-        norm_x = max(0.0, min(1.0, x / win_w))
-        norm_y = max(0.0, min(1.0, y / win_h))
+        fw = current_frame_shape["w"]
+        fh = current_frame_shape["h"]
+
+        # Normalisasi rasio terhadap dimensi frame asli
+        norm_x = max(0.0, min(1.0, x / fw))
+        norm_y = max(0.0, min(1.0, y / fh))
 
         if event == cv2.EVENT_LBUTTONDOWN:
             send_command({"type": "click", "norm_x": norm_x, "norm_y": norm_y, "btn": "left"})
@@ -148,8 +182,7 @@ def start_remote_session(target_ip):
         elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
             send_command({"type": "move", "norm_x": norm_x, "norm_y": norm_y})
 
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, win_w, win_h)
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, on_mouse)
 
     data = b""
@@ -179,6 +212,11 @@ def start_remote_session(target_ip):
             encoded_frame = pickle.loads(frame_data)
             frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
 
+            # Update dimensi asli frame yang diterima
+            h, w, _ = frame.shape
+            current_frame_shape["w"] = w
+            current_frame_shape["h"] = h
+
             cv2.imshow(window_name, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -199,7 +237,78 @@ def start_remote_session(target_ip):
         cv2.destroyAllWindows()
 
 # ==========================================
-# 3. GUI CONTROLLER (Tkinter)
+# 3. AUTO-UPDATER VIA GITHUB RELEASES
+# ==========================================
+def check_for_updates():
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "AutoUpdaterApp"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status != 200:
+                messagebox.showerror("Error", "Gagal menghubungi server GitHub.")
+                return
+            data = json.loads(response.read().decode())
+
+        latest_version = data.get("tag_name")
+        if not latest_version:
+            messagebox.showinfo("Update", "Belum ada rilis versi di GitHub.")
+            return
+
+        if latest_version == CURRENT_VERSION:
+            messagebox.showinfo("Update", f"Aplikasi sudah versi terbaru ({CURRENT_VERSION}).")
+            return
+
+        download_url = None
+        for asset in data.get("assets", []):
+            if asset.get("name", "").endswith(".exe"):
+                download_url = asset.get("browser_download_url")
+                break
+
+        if not download_url:
+            messagebox.showwarning("Update", f"Versi {latest_version} ditemukan, tetapi file .exe tidak ada di Release.")
+            return
+
+        tanya = messagebox.askyesno(
+            "Update Ditemukan!",
+            f"Versi baru: {latest_version}\nVersi saat ini: {CURRENT_VERSION}\n\nDownload dan install sekarang?"
+        )
+        if tanya:
+            threading.Thread(target=download_and_replace, args=(download_url,), daemon=True).start()
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Gagal mengecek update:\n{e}")
+
+def download_and_replace(download_url):
+    try:
+        if getattr(sys, 'frozen', False):
+            current_exe = sys.executable
+        else:
+            messagebox.showinfo("Info", "Auto-update hanya berjalan saat file sudah berupa .exe.")
+            return
+
+        app_dir = os.path.dirname(current_exe)
+        new_exe = os.path.join(app_dir, "update_temp.exe")
+        updater_bat = os.path.join(app_dir, "updater.bat")
+
+        urllib.request.urlretrieve(download_url, new_exe)
+
+        bat_script = f"""@echo off
+timeout /t 2 /nobreak > nul
+move /y "{new_exe}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+"""
+        with open(updater_bat, "w") as f:
+            f.write(bat_script)
+
+        subprocess.Popen(updater_bat, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        sys.exit(0)
+
+    except Exception as e:
+        messagebox.showerror("Update Gagal", f"Gagal mengunduh atau memasang update:\n{e}")
+
+# ==========================================
+# 4. GUI UTAMA (Tkinter)
 # ==========================================
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -214,17 +323,16 @@ def get_local_ip():
 
 def launch_gui():
     root = tk.Tk()
-    root.title("Python Remote Desktop (LAN)")
-    root.geometry("380x230")
+    root.title(f"LAN Remote Desktop - {CURRENT_VERSION}")
+    root.geometry("380x260")
     root.resizable(False, False)
 
     local_ip = get_local_ip()
 
-    tk.Label(root, text="Remote Desktop Dual-Mode", font=("Helvetica", 14, "bold")).pack(pady=10)
+    tk.Label(root, text="Remote Desktop Dual-Mode", font=("Helvetica", 13, "bold")).pack(pady=10)
 
-    # Info IP perangkat ini
     info_frame = tk.Frame(root)
-    info_frame.pack(pady=5)
+    info_frame.pack(pady=3)
     tk.Label(info_frame, text="IP Perangkat Ini:", font=("Helvetica", 10)).pack(side=tk.LEFT)
     ip_label = tk.Label(info_frame, text=f" {local_ip} ", font=("Helvetica", 10, "bold"), fg="blue")
     ip_label.pack(side=tk.LEFT)
@@ -232,9 +340,8 @@ def launch_gui():
     status_label = tk.Label(root, text="Status: Listener Aktif (Siap di-remote)", fg="green", font=("Helvetica", 9))
     status_label.pack(pady=2)
 
-    # Input target IP
     connect_frame = tk.Frame(root)
-    connect_frame.pack(pady=15)
+    connect_frame.pack(pady=12)
     tk.Label(connect_frame, text="Target IP: ").pack(side=tk.LEFT)
     ip_entry = tk.Entry(connect_frame, width=18, font=("Helvetica", 10))
     ip_entry.pack(side=tk.LEFT, padx=5)
@@ -247,15 +354,29 @@ def launch_gui():
             return
         threading.Thread(target=start_remote_session, args=(target,), daemon=True).start()
 
-    connect_btn = tk.Button(root, text="Hubungkan / Remote", command=on_connect_btn, bg="#2563eb", fg="white", font=("Helvetica", 10, "bold"), padx=10, pady=5)
-    connect_btn.pack(pady=5)
+    connect_btn = tk.Button(
+        root, 
+        text="Hubungkan / Remote", 
+        command=on_connect_btn, 
+        bg="#2563eb", 
+        fg="white", 
+        font=("Helvetica", 10, "bold"), 
+        padx=10, 
+        pady=4
+    )
+    connect_btn.pack(pady=4)
+
+    btn_update = tk.Button(
+        root, 
+        text="Check Update", 
+        command=lambda: threading.Thread(target=check_for_updates, daemon=True).start(),
+        font=("Helvetica", 8)
+    )
+    btn_update.pack(side=tk.BOTTOM, pady=8)
 
     root.mainloop()
 
 if __name__ == "__main__":
-    # Jalankan listener server di background
     threading.Thread(target=run_input_server, daemon=True).start()
     threading.Thread(target=run_video_server, daemon=True).start()
-
-    # Jalankan GUI
     launch_gui()

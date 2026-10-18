@@ -4,6 +4,8 @@ setlocal
 set APP_NAME=LAN_RemoteDesktop
 set MAIN_SCRIPT=remote_app.py
 
+set /p NEW_TAG="Masukkan Versi Release Baru (misal v1.0.1): "
+
 echo ==========================================
 echo     BUILDING STANDALONE EXECUTABLE
 echo ==========================================
@@ -16,14 +18,16 @@ if exist *.spec del /q *.spec
 echo [*] Memulai proses kompilasi via launcher 'py'...
 py -m PyInstaller --noconfirm --onefile --windowed --name "%APP_NAME%" --hidden-import="cv2" --hidden-import="mss" --hidden-import="pyautogui" --hidden-import="numpy" "%MAIN_SCRIPT%"
 
-echo.
-if exist "dist\%APP_NAME%.exe" (
-    echo ==========================================
-    echo [+] SUKSES! File .exe berhasil dibuat:
-    echo     --^> dist\%APP_NAME%.exe
-    echo ==========================================
-) else (
-    echo [-] Build gagal atau file .exe tidak ditemukan.
+if not exist "dist\%APP_NAME%.exe" (
+    echo [-] Build gagal! File exe tidak ditemukan.
+    pause
+    exit /b 1
 )
+
+echo.
+echo ==========================================
+echo     UPLOADING TO GITHUB RELEASES
+echo ==========================================
+py upload_release.py %NEW_TAG%
 
 pause
