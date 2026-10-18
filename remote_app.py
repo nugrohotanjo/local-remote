@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import json
 import socket
 import struct
@@ -18,10 +19,9 @@ import ctypes
 # ==========================================
 # 0. SISTEM & DISPLAY SCALING FIX
 # ==========================================
-# Mematikan failsafe PyAutoGUI agar kursor tidak crash saat menyentuh sudut layar
 pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
 
-# Mengaktifkan DPI Awareness agar Windows tidak memanipulasi koordinat pixel (125%/150% scaling)
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -30,10 +30,18 @@ except Exception:
     except Exception:
         pass
 
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_host_cursor_pos():
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
 # ==========================================
 # KONFIGURASI APLIKASI & GITHUB RELEASES
 # ==========================================
-CURRENT_VERSION = "v1.0.1"
+CURRENT_VERSION = "v1.0.3"
 GITHUB_REPO = "nugrohotanjo/local-remote"
 
 VIDEO_PORT = 9999
@@ -45,6 +53,7 @@ INPUT_PORT = 9998
 def run_input_server():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         server_sock.bind(("0.0.0.0", INPUT_PORT))
         server_sock.listen(5)
@@ -63,6 +72,7 @@ def run_input_server():
 
     while True:
         conn, _ = server_sock.accept()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         data = b""
         try:
             while True:
@@ -95,12 +105,17 @@ def run_input_server():
                 if action == "move":
                     target_x = screen_left + int(cmd["norm_x"] * screen_w)
                     target_y = screen_top + int(cmd["norm_y"] * screen_h)
-                    pyautogui.moveTo(target_x, target_y)
+                    ctypes.windll.user32.SetCursorPos(target_x, target_y)
                 elif action == "click":
                     target_x = screen_left + int(cmd["norm_x"] * screen_w)
                     target_y = screen_top + int(cmd["norm_y"] * screen_h)
-                    pyautogui.moveTo(target_x, target_y)
+                    ctypes.windll.user32.SetCursorPos(target_x, target_y)
                     pyautogui.click(button=cmd.get("btn", "left"))
+                elif action == "scroll":
+                    # Scroll mouse (nilai delta positif untuk scroll ke atas, negatif ke bawah)
+                    steps = cmd.get("steps", 0)
+                    if steps != 0:
+                        pyautogui.scroll(steps)
                 elif action == "key":
                     key = cmd.get("key")
                     if key:
@@ -113,6 +128,7 @@ def run_input_server():
 def run_video_server():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         server_sock.bind(("0.0.0.0", VIDEO_PORT))
         server_sock.listen(5)
@@ -126,12 +142,21 @@ def run_video_server():
 
         while True:
             conn, _ = server_sock.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 while True:
                     raw_frame = np.array(sct.grab(monitor))
                     frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGRA2BGR)
-                    _, encoded_frame = cv2.imencode(".jpg", frame, encode_param)
 
+                    # Gambar kursor visual virtual di layar host
+                    cur_x, cur_y = get_host_cursor_pos()
+                    rel_x = cur_x - monitor["left"]
+                    rel_y = cur_y - monitor["top"]
+                    if 0 <= rel_x < monitor["width"] and 0 <= rel_y < monitor["height"]:
+                        cv2.circle(frame, (rel_x, rel_y), 6, (0, 0, 255), -1)
+                        cv2.circle(frame, (rel_x, rel_y), 8, (255, 255, 255), 1)
+
+                    _, encoded_frame = cv2.imencode(".jpg", frame, encode_param)
                     data = pickle.dumps(encoded_frame)
                     size = len(data)
                     conn.sendall(struct.pack(">L", size) + data)
@@ -148,16 +173,17 @@ def start_remote_session(target_ip):
 
     try:
         input_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        input_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         input_sock.connect((target_ip, INPUT_PORT))
 
         video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        video_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         video_sock.connect((target_ip, VIDEO_PORT))
     except Exception as e:
         messagebox.showerror("Koneksi Gagal", f"Tidak dapat terhubung ke {target_ip}:\n{e}")
         return
 
-    # Menyimpan resolusi frame aktual secara dinamis
-    current_frame_shape = {"w": 1920, "h": 1080}
+    last_move_time = [0.0]
 
     def send_command(cmd_dict):
         try:
@@ -168,21 +194,37 @@ def start_remote_session(target_ip):
             pass
 
     def on_mouse(event, x, y, flags, param):
-        fw = current_frame_shape["w"]
-        fh = current_frame_shape["h"]
+        # Ambil ukuran area gambar jendela aktual untuk mapping koordinat akurat
+        try:
+            rect = cv2.getWindowImageRect(window_name)
+            win_w = rect[2] if rect[2] > 0 else 1280
+            win_h = rect[3] if rect[3] > 0 else 720
+        except Exception:
+            win_w, win_h = 1280, 720
 
-        # Normalisasi rasio terhadap dimensi frame asli
-        norm_x = max(0.0, min(1.0, x / fw))
-        norm_y = max(0.0, min(1.0, y / fh))
+        norm_x = max(0.0, min(1.0, x / win_w))
+        norm_y = max(0.0, min(1.0, y / win_h))
 
-        if event == cv2.EVENT_LBUTTONDOWN:
+        # 1. Pergerakan Mouse (Hover & Drag)
+        if event == cv2.EVENT_MOUSEMOVE:
+            now = time.time()
+            if now - last_move_time[0] > 0.016:
+                last_move_time[0] = now
+                send_command({"type": "move", "norm_x": norm_x, "norm_y": norm_y})
+        # 2. Klik Mouse
+        elif event == cv2.EVENT_LBUTTONDOWN:
             send_command({"type": "click", "norm_x": norm_x, "norm_y": norm_y, "btn": "left"})
         elif event == cv2.EVENT_RBUTTONDOWN:
             send_command({"type": "click", "norm_x": norm_x, "norm_y": norm_y, "btn": "right"})
-        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
-            send_command({"type": "move", "norm_x": norm_x, "norm_y": norm_y})
+        # 3. Scroll Mouse (Mouse Wheel)
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            delta = cv2.getMouseWheelDelta(flags)
+            steps = 120 if delta > 0 else -120
+            send_command({"type": "scroll", "steps": steps})
 
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    # WINDOW_NORMAL memungkinkan jendela di-resize / diperkecil agar tidak ngezoom
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 720)
     cv2.setMouseCallback(window_name, on_mouse)
 
     data = b""
@@ -211,11 +253,6 @@ def start_remote_session(target_ip):
 
             encoded_frame = pickle.loads(frame_data)
             frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
-
-            # Update dimensi asli frame yang diterima
-            h, w, _ = frame.shape
-            current_frame_shape["w"] = w
-            current_frame_shape["h"] = h
 
             cv2.imshow(window_name, frame)
 
@@ -270,15 +307,19 @@ def check_for_updates():
 
         tanya = messagebox.askyesno(
             "Update Ditemukan!",
-            f"Versi baru: {latest_version}\nVersi saat ini: {CURRENT_VERSION}\n\nDownload dan install sekarang?"
+            f"Versi baru: {latest_version}\nVersi saat ini: {CURRENT_VERSION}\n\nDownload dan pasang versi baru sekarang?"
         )
         if tanya:
-            threading.Thread(target=download_and_replace, args=(download_url,), daemon=True).start()
+            threading.Thread(
+                target=download_and_replace, 
+                args=(download_url, latest_version), 
+                daemon=True
+            ).start()
 
     except Exception as e:
         messagebox.showerror("Error", f"Gagal mengecek update:\n{e}")
 
-def download_and_replace(download_url):
+def download_and_replace(download_url, new_version):
     try:
         if getattr(sys, 'frozen', False):
             current_exe = sys.executable
@@ -287,15 +328,17 @@ def download_and_replace(download_url):
             return
 
         app_dir = os.path.dirname(current_exe)
-        new_exe = os.path.join(app_dir, "update_temp.exe")
+        clean_tag = new_version.replace(" ", "_")
+        new_exe_name = f"LAN_RemoteDesktop_{clean_tag}.exe"
+        new_exe_path = os.path.join(app_dir, new_exe_name)
         updater_bat = os.path.join(app_dir, "updater.bat")
 
-        urllib.request.urlretrieve(download_url, new_exe)
+        urllib.request.urlretrieve(download_url, new_exe_path)
 
         bat_script = f"""@echo off
 timeout /t 2 /nobreak > nul
-move /y "{new_exe}" "{current_exe}"
-start "" "{current_exe}"
+if exist "{current_exe}" del /f /q "{current_exe}"
+start "" "{new_exe_path}"
 del "%~f0"
 """
         with open(updater_bat, "w") as f:

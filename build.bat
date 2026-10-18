@@ -10,6 +10,9 @@ echo ==========================================
 echo     BUILDING STANDALONE EXECUTABLE
 echo ==========================================
 
+:: Tutup paksa jika aplikasi sedang terbuka
+taskkill /f /im %APP_NAME%.exe 2>nul
+
 echo [*] Membersihkan cache lama...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
